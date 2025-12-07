@@ -7,7 +7,7 @@ const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 const noteSchema: Schema = {
   type: Type.OBJECT,
   properties: {
-    pitch: { type: Type.STRING, description: "The scientific pitch notation (e.g., C4, G#5). For rests, use 'REST'." },
+    pitch: { type: Type.STRING, description: "Scientific pitch notation (e.g., C4, G#5). For rests, use 'REST'." },
     duration: { type: Type.STRING, description: "Duration in Tone.js notation (e.g., 4n, 8n, 2n, 1n, 16n)." },
     x: { type: Type.NUMBER, description: "The normalized horizontal position (0.0 to 1.0) of the note head within the system width." }
   },
@@ -19,6 +19,11 @@ const systemSchema: Schema = {
   properties: {
     yTop: { type: Type.NUMBER, description: "Normalized Y coordinate (0-1) of the top of this system (staff)." },
     yBottom: { type: Type.NUMBER, description: "Normalized Y coordinate (0-1) of the bottom of this system (staff)." },
+    measureLines: {
+      type: Type.ARRAY,
+      items: { type: Type.NUMBER },
+      description: "List of normalized X coordinates (0.0 to 1.0) for all vertical bar lines (measure boundaries) in this system."
+    },
     notes: { 
       type: Type.ARRAY, 
       items: noteSchema,
@@ -43,7 +48,7 @@ const sheetAnalysisSchema: Schema = {
 };
 
 export async function analyzeSheetMusic(base64Image: string): Promise<SheetAnalysis> {
-  const modelId = 'gemini-3-pro-preview'; // Using Pro for better spatial reasoning
+  const modelId = 'gemini-3-pro-preview'; 
 
   try {
     const result = await ai.models.generateContent({
@@ -52,7 +57,7 @@ export async function analyzeSheetMusic(base64Image: string): Promise<SheetAnaly
         parts: [
           {
             inlineData: {
-              mimeType: 'image/jpeg', // Assuming converted to jpeg or png before sending
+              mimeType: 'image/jpeg', 
               data: base64Image
             }
           },
@@ -60,17 +65,25 @@ export async function analyzeSheetMusic(base64Image: string): Promise<SheetAnaly
             text: `Analyze this sheet music image. 
             Transcription Goal: Playable Piano Performance.
             
-            1. Identify "Systems". A System is a line of music played across the page. For piano, a System usually consists of TWO staves (Treble and Bass) connected by a brace. 
-            CRITICAL: Treat the Grand Staff (both Treble and Bass staves together) as a SINGLE System. Do not split them.
+            1. **Systems Identification**: 
+               - A "System" includes ALL staves played simultaneously (usually Treble + Bass connected by a brace).
+               - DO NOT confuse the bass staff of one system with the treble staff of the next.
+               - Separate systems clearly based on vertical whitespace.
             
-            2. Extract Notes.
-            For each System, list ALL notes from BOTH the Treble and Bass staves.
-            IMPORTANT: Maintain vertical alignment. Notes that are vertically aligned (played together) must have the same or very similar 'x' coordinate.
+            2. **Key Signature (CRITICAL)**:
+               - Identify the Key Signature at the start of the first staff.
+               - **You MUST apply the key signature to ALL notes.**
+               - Example: If the key is G Major (1 Sharp), every 'F' note is 'F#'. 
+               - Example: If the key is F Major (1 Flat), every 'B' note is 'Bb'.
             
-            3. Pitch & Duration.
-            - Pitch: Scientific notation (C4, F#3). Use 'REST' for rests.
-            - Duration: Tone.js notation (4n, 8n, 2n, 1n).
-            - X: Normalized 0.0 to 1.0 (left to right).
+            3. **Note Extraction**:
+               - For each System, list all notes from top to bottom, left to right.
+               - **Grand Staff Merging**: Mix notes from the treble and bass clefs of the SAME system into a single chronological list sorted by X position.
+               - **Vertical Alignment**: Notes that form a chord or are played together MUST have the same (or extremely close) 'x' value.
+            
+            4. **Pitch & Duration**:
+               - Pitch: Scientific notation (C4, F#3). Check octaves carefully (Bass clef is usually C2-C4, Treble C4-C6).
+               - Duration: Tone.js notation (4n, 8n, 2n, 1n).
             
             Output JSON matching the schema.
             `
@@ -80,7 +93,7 @@ export async function analyzeSheetMusic(base64Image: string): Promise<SheetAnaly
       config: {
         responseMimeType: "application/json",
         responseSchema: sheetAnalysisSchema,
-        systemInstruction: "You are an expert music theorist and pianist. Your goal is to transcribe sheet music into a structured format for a computer to play."
+        systemInstruction: "You are an expert music theorist and pianist. Your goal is to transcribe sheet music into a structured format for a computer to play. You pay extreme attention to Key Signatures and vertical alignment."
       }
     });
 

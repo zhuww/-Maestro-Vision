@@ -18,6 +18,9 @@ const App: React.FC = () => {
   const [currentNoteIndex, setCurrentNoteIndex] = useState(-1);
   const [tempo, setTempo] = useState(DEFAULT_TEMPO);
   const [isAudioReady, setIsAudioReady] = useState(false);
+  
+  // Track the last page ID that was successfully scheduled on the timeline
+  const [scheduledUpToPageId, setScheduledUpToPageId] = useState<string | null>(null);
 
   // Refs for tracking playback state inside callbacks
   const playingRef = useRef(false);
@@ -32,8 +35,63 @@ const App: React.FC = () => {
     audioService.setTempo(tempo);
   }, [tempo]);
 
-  const handleFilesSelected = async (files: File[]) => {
-    // Create page objects immediately
+  // --- Smart Analysis Queue ---
+  // Sequentially processes pending pages, prioritizing current and next page.
+  useEffect(() => {
+    // 1. Check if any page is currently being analyzed (Limit 1 concurrent analysis)
+    const isAnalyzing = pages.some(p => p.status === 'analyzing');
+    if (isAnalyzing) return;
+
+    // 2. Determine Priority:
+    // Priority A: Current Page
+    if (pages[currentPageIndex]?.status === 'pending') {
+        processPage(pages[currentPageIndex]);
+        return;
+    }
+    
+    // Priority B: Next Page (Buffered)
+    if (pages[currentPageIndex + 1]?.status === 'pending') {
+        processPage(pages[currentPageIndex + 1]);
+        return;
+    }
+
+    // Priority C: Any pending page (FIFO)
+    const firstPending = pages.find(p => p.status === 'pending');
+    if (firstPending) {
+        processPage(firstPending);
+    }
+  }, [pages, currentPageIndex]);
+
+  // --- Dynamic Playback Scheduler ---
+  // Watches for pages becoming ready while playing and appends them to the schedule
+  useEffect(() => {
+      if (!isPlaying || !scheduledUpToPageId) return;
+
+      const scheduledIndex = pages.findIndex(p => p.id === scheduledUpToPageId);
+      if (scheduledIndex === -1) return;
+
+      const nextPage = pages[scheduledIndex + 1];
+      
+      // If the next page exists, is ready, but hasn't been scheduled yet (implied by scheduledUpToPageId check)
+      if (nextPage && nextPage.status === 'ready' && nextPage.data) {
+          console.log("Dynamically scheduling next page:", nextPage.id);
+          const prevEndTime = audioService.getPageEndTime(scheduledUpToPageId);
+          
+          if (prevEndTime !== undefined) {
+              audioService.schedulePage(
+                  nextPage,
+                  prevEndTime,
+                  onNotePlayCallback
+              );
+              setScheduledUpToPageId(nextPage.id);
+          }
+      }
+  }, [pages, isPlaying, scheduledUpToPageId]);
+
+
+  const handleFilesSelected = (files: File[]) => {
+    // Create page objects with 'pending' status. 
+    // The Analysis Queue effect will pick them up.
     const newPages: SheetPage[] = files.map(file => ({
       id: Math.random().toString(36).substr(2, 9),
       imageUrl: URL.createObjectURL(file),
@@ -42,35 +100,82 @@ const App: React.FC = () => {
     }));
 
     setPages(prev => [...prev, ...newPages]);
-    
-    // Process ALL pages in background (no await in loop)
-    newPages.forEach(page => {
-        processPage(page);
-    });
+  };
+
+  /**
+   * Compresses and resizes an image file to reduce payload size for Gemini API.
+   * Target: Max 1024px width/height, JPEG quality 0.8
+   */
+  const compressImage = async (file: File): Promise<string> => {
+      return new Promise((resolve, reject) => {
+          const img = new Image();
+          const url = URL.createObjectURL(file);
+          
+          img.onload = () => {
+              const canvas = document.createElement('canvas');
+              const MAX_SIZE = 1024; // Resize to max 1024px to prevent payload errors
+              let width = img.width;
+              let height = img.height;
+
+              if (width > height) {
+                  if (width > MAX_SIZE) {
+                      height *= MAX_SIZE / width;
+                      width = MAX_SIZE;
+                  }
+              } else {
+                  if (height > MAX_SIZE) {
+                      width *= MAX_SIZE / height;
+                      height = MAX_SIZE;
+                  }
+              }
+
+              canvas.width = width;
+              canvas.height = height;
+              const ctx = canvas.getContext('2d');
+              if (!ctx) {
+                  URL.revokeObjectURL(url);
+                  reject(new Error("Canvas context failed"));
+                  return;
+              }
+              
+              ctx.drawImage(img, 0, 0, width, height);
+              
+              // Export as JPEG with 0.8 quality
+              const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+              URL.revokeObjectURL(url);
+              resolve(dataUrl);
+          };
+
+          img.onerror = () => {
+              URL.revokeObjectURL(url);
+              reject(new Error("Failed to load image"));
+          };
+          
+          img.src = url;
+      });
   };
 
   const processPage = async (page: SheetPage) => {
+    // Mark as analyzing
     setPages(prev => prev.map(p => p.id === page.id ? { ...p, status: 'analyzing' } : p));
 
     try {
-      // 1. Convert File to Base64
-      const base64 = await fileToBase64(page.file);
-      const cleanBase64 = base64.split(',')[1];
-
-      // 2. Call Gemini
+      // Compress image before sending to prevent XHR/Payload errors
+      const base64Full = await compressImage(page.file);
+      const cleanBase64 = base64Full.split(',')[1];
+      
       const analysis = await analyzeSheetMusic(cleanBase64);
 
-      // 3. Update State
       setPages(prev => {
           const updated = prev.map(p => 
             p.id === page.id ? { ...p, status: 'ready', data: analysis } : p
           );
           
-          // Auto-set tempo from the first page if available
+          // Auto-set tempo from the first page if available and not yet set
           if (page.id === updated[0].id && analysis.tempo) {
               setTempo(analysis.tempo);
           }
-          return updated as SheetPage[]; // explicit cast to avoid union type issues
+          return updated as SheetPage[];
       });
 
     } catch (err: any) {
@@ -79,15 +184,6 @@ const App: React.FC = () => {
         p.id === page.id ? { ...p, status: 'error', errorMsg: err.message || 'Analysis failed' } : p
       ));
     }
-  };
-
-  const fileToBase64 = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
   };
 
   const handlePlayPause = async () => {
@@ -100,6 +196,38 @@ const App: React.FC = () => {
     }
   };
 
+  // Define callback outside to be reusable
+  const onNotePlayCallback = (pageId: string, sysIdx: number, noteIdx: number) => {
+      if (!playingRef.current) return;
+      
+      // Update active page view logic
+      setCurrentPageIndex(prevIndex => prevIndex); 
+
+      // Update cursor
+      setCurrentSystemIndex(sysIdx);
+      setCurrentNoteIndex(noteIdx);
+      
+      // Dispatch event for components that need strict sync
+      window.dispatchEvent(new CustomEvent('playback-update', { detail: { pageId } }));
+  };
+
+  // Listen for page updates from audio thread
+  useEffect(() => {
+      const handler = (e: Event) => {
+          const detail = (e as CustomEvent).detail;
+          setPages(currentPages => {
+              const idx = currentPages.findIndex(p => p.id === detail.pageId);
+              if (idx !== -1 && idx !== currentPageIndex) {
+                  setCurrentPageIndex(idx);
+              }
+              return currentPages;
+          });
+      };
+      window.addEventListener('playback-update', handler);
+      return () => window.removeEventListener('playback-update', handler);
+  }, [currentPageIndex]);
+
+
   const startPlayback = async () => {
     await audioService.startContext();
     
@@ -108,55 +236,37 @@ const App: React.FC = () => {
 
     setIsPlaying(true);
     playingRef.current = true;
+    setScheduledUpToPageId(null);
     
-    // Reset Transport
     Tone.Transport.stop();
     Tone.Transport.cancel();
     
-    // Schedule sequence starting from current page
     let accumulatedTime = 0;
+    let lastScheduledId = null;
     
-    // Iterate through pages starting from the current one
+    // Schedule available contiguous pages starting from current
     for (let i = currentPageIndex; i < pages.length; i++) {
         const p = pages[i];
         if (p.status === 'ready' && p.data) {
-            // Schedule the page
             accumulatedTime = audioService.schedulePage(
                 p, 
                 accumulatedTime, 
-                (pageId, sysIdx, noteIdx) => {
-                    if (!playingRef.current) return;
-                    
-                    // Logic to switch view to the playing page
-                    const activePageIndex = pages.findIndex(pg => pg.id === pageId);
-                    if (activePageIndex !== -1) {
-                         // We use a functional update in a ref or check vs state to avoid loop
-                         // However, since this callback runs on AnimationFrames via Tone.Draw, 
-                         // updating React state is okay but we must be careful.
-                         // We only update if index changed to avoid re-renders.
-                         setCurrentPageIndex(prev => {
-                             if (prev !== activePageIndex) return activePageIndex;
-                             return prev;
-                         });
-                    }
-
-                    setCurrentSystemIndex(sysIdx);
-                    setCurrentNoteIndex(noteIdx);
-                }
+                onNotePlayCallback
             );
+            lastScheduledId = p.id;
         } else {
-            // If we hit a page that isn't ready, the music will stop there.
-            // Advanced: we could schedule a check to see if it becomes ready later.
             break; 
         }
     }
     
+    setScheduledUpToPageId(lastScheduledId);
     audioService.start();
   };
 
   const handleStop = () => {
     setIsPlaying(false);
     playingRef.current = false;
+    setScheduledUpToPageId(null);
     audioService.stop();
     setCurrentSystemIndex(-1);
     setCurrentNoteIndex(-1);
@@ -177,7 +287,6 @@ const App: React.FC = () => {
   };
 
   const activePage = pages[currentPageIndex];
-  // Determine if ready or if strictly previous/next page is ready for simple UI
   const isReady = activePage?.status === 'ready';
 
   return (
@@ -238,8 +347,6 @@ const App: React.FC = () => {
                             if (!isPlaying) {
                                 setCurrentPageIndex(idx);
                             } else {
-                                // If playing, just jump view to that page? Or stop and go?
-                                // Usually safer to stop to avoid confusion
                                 handleStop();
                                 setCurrentPageIndex(idx);
                             }
@@ -253,6 +360,7 @@ const App: React.FC = () => {
                     >
                         <span>Page {idx + 1}</span>
                         {p.status === 'analyzing' && <div className="animate-spin h-3 w-3 border border-current border-t-transparent rounded-full" />}
+                        {p.status === 'pending' && <span className="text-xs text-gray-600">Wait</span>}
                         {p.status === 'error' && <span className="text-red-500">!</span>}
                     </button>
                 ))}

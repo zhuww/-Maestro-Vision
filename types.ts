@@ -10,6 +10,7 @@ export interface ParsedSystem {
   yTop: number; // Normalized Y position of the top of this staff system (0-1)
   yBottom: number; // Normalized Y position of the bottom of this staff system (0-1)
   notes: ParsedNote[];
+  measureLines?: number[]; // Array of normalized X positions for bar lines
 }
 
 export interface SheetAnalysis {
