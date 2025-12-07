@@ -1,0 +1,5 @@
+{
+  "name": "Maestro Vision",
+  "description": "Upload sheet music to instantly analyze, play back with a piano, and visually track the melody.",
+  "requestFramePermissions": []
+}
